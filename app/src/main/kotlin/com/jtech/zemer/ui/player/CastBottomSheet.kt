@@ -86,7 +86,11 @@ fun CastPicker(
     val service = playerConnection.service
     val handler = service.discoveryHandler
     val connectedDevice by handler.connectedDeviceFlow.collectAsState()
-    val devices by handler.discoveredDevicesFlow.collectAsState()
+    val fcastDevices by handler.discoveredDevicesFlow.collectAsState()
+    val sonosDevices by service.sonosProvider.discoveredDevices.collectAsState()
+    val deviceItems = remember(fcastDevices, sonosDevices) {
+        fcastDevices.map { CastDeviceItem.FCast(it) } + sonosDevices.map { CastDeviceItem.Sonos(it) }
+    }
     val libState by service.castLibState.collectAsState()
     val uriHandler = LocalUriHandler.current
     val context = LocalContext.current
@@ -180,7 +184,7 @@ fun CastPicker(
                     onClick = { handler.disconnect(); onDismiss() },
                 )
 
-                devices.isEmpty() -> CastCenteredColumn {
+                deviceItems.isEmpty() -> CastCenteredColumn {
                     CastSpinnerText(R.string.cast_searching)
                     Spacer(Modifier.height(4.dp))
                     CenteredText(
@@ -193,15 +197,35 @@ fun CastPicker(
                 }
 
                 else -> {
-                    devices.forEach { device ->
-                        val isConnecting = connectingDevice == device.name
-                        CastDeviceRow(
-                            iconRes = R.drawable.cast,
-                            name = device.name,
-                            subtitle = if (isConnecting) stringResource(R.string.cast_connecting) else null,
-                            connecting = isConnecting,
-                            onClick = { connect(device) },
-                        )
+                    deviceItems.forEach { item ->
+                        val isConnecting = connectingDevice == item.displayName
+                        when (item) {
+                            is CastDeviceItem.FCast -> {
+                                CastDeviceRow(
+                                    iconRes = R.drawable.cast,
+                                    name = item.displayName,
+                                    subtitle = if (isConnecting) stringResource(R.string.cast_connecting) else null,
+                                    connecting = isConnecting,
+                                    onClick = { connect(item.info) },
+                                )
+                            }
+                            is CastDeviceItem.Sonos -> {
+                                CastDeviceRow(
+                                    iconRes = R.drawable.cast,
+                                    name = item.displayName,
+                                    subtitle = if (isConnecting) stringResource(R.string.connecting_to_sonos, item.displayName)
+                                               else stringResource(R.string.sonos_speaker),
+                                    connecting = isConnecting,
+                                    onClick = {
+                                        Toast.makeText(
+                                            context,
+                                            context.getString(R.string.connecting_to_sonos, item.displayName),
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                    },
+                                )
+                            }
+                        }
                     }
                     Spacer(Modifier.height(12.dp))
                     CastFcastSection(uriHandler = uriHandler, context = context)

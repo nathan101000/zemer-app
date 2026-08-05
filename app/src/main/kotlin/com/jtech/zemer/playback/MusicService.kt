@@ -238,6 +238,9 @@ class MusicService :
         EpisodePositionTracker(player, scope, database) { discoveryHandler.isConnected }
     }
 
+    // Sonos speaker provider using local SSDP UDP multicast discovery.
+    val sonosProvider by lazy { com.jtech.zemer.playback.sonos.SonosProvider(this, scope) }
+
     private lateinit var audioManager: AudioManager
     private var audioFocusRequest: AudioFocusRequest? = null
     private var lastAudioFocusState = AudioManager.AUDIOFOCUS_NONE
@@ -382,6 +385,7 @@ class MusicService :
         if (deviceDiscoverer == null && castLibLoader.isReady) {
             deviceDiscoverer = NsdDeviceDiscoverer(this, discoveryHandler)
         }
+        sonosProvider.startDiscovery()
     }
 
     /**

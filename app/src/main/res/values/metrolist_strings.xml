@@ -701,4 +701,7 @@
         <item quantity="one">%d channel</item>
         <item quantity="other">%d channels</item>
     </plurals>
+    <!-- Sonos -->
+    <string name="sonos_speaker">Sonos speaker</string>
+    <string name="connecting_to_sonos">Connecting to %1$s…</string>
 </resources>
