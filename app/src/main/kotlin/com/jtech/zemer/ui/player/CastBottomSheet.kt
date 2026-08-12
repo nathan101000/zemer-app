@@ -46,6 +46,7 @@ import com.jtech.zemer.models.MediaMetadata
 import com.jtech.zemer.playback.CastConnectResult
 import com.jtech.zemer.playback.CastLibState
 import com.jtech.zemer.playback.PlayerConnection
+import com.jtech.zemer.playback.sonos.SonosDevice
 import com.jtech.zemer.ui.component.DefaultDialog
 import com.jtech.zemer.ui.component.focusBorder
 import kotlinx.coroutines.launch
@@ -76,6 +77,10 @@ private fun copyFcast(context: Context) {
  * Metrolist's. The FCast native lib isn't bundled, so before any casting it asks for consent to a
  * one-time download (then a spinner), surfaces failures with retry, and offers a receiver-install link
  * with share / copy. Self-contained: collects its own state and resolves the stream URL at connect time.
+ *
+ * Sonos devices are discovered via SSDP independently of the FCast native lib and appear in the same
+ * list. Sonos connect flow mirrors the FCast path: pause local playback, resolve the stream, route it
+ * through the phone-side relay, hand the URL to SonosConnector, and dismiss on success.
  */
 @Composable
 fun CastPicker(
@@ -85,7 +90,13 @@ fun CastPicker(
 ) {
     val service = playerConnection.service
     val handler = service.discoveryHandler
-    val connectedDevice by handler.connectedDeviceFlow.collectAsState()
+
+    // FCast connection state
+    val connectedFcastDevice by handler.connectedDeviceFlow.collectAsState()
+    // Sonos connection state — separate from FCast, never share the same session
+    val connectedSonosDevice by service.sonosConnector.connectedDevice.collectAsState()
+    val isAnythingConnected = connectedFcastDevice != null || connectedSonosDevice != null
+
     val fcastDevices by handler.discoveredDevicesFlow.collectAsState()
     val sonosDevices by service.sonosProvider.discoveredDevices.collectAsState()
     val deviceItems = remember(fcastDevices, sonosDevices) {
@@ -99,10 +110,11 @@ fun CastPicker(
 
     CastDownloadSuccessEffect(libState)
 
-    // Once the lib is present (e.g. just downloaded), start NSD discovery so devices appear, and run
-    // one refresh burst so the list reflects what is advertised NOW — the SDK's long-lived discoverer
-    // never re-checks a device once found, so without this a receiver that closed or changed IP since
-    // the last picker open would still be listed.
+    // FCast NSD discovery: start once the native lib is ready. Sonos SSDP discovery runs
+    // unconditionally via startDiscovery() regardless of FCast lib state.
+    LaunchedEffect(Unit) {
+        service.sonosProvider.startDiscovery()
+    }
     LaunchedEffect(libState) {
         if (libState is CastLibState.Ready) {
             service.startDiscovery()
@@ -136,24 +148,95 @@ fun CastPicker(
         }
     }
 
+    fun connectSonos(device: SonosDevice) {
+        if (connectingDevice != null) return
+        connectingDevice = device.roomName
+        service.scope.launch {
+            try {
+                val player = service.player
+                player.pause()
+
+                val currentId = player.currentMediaItem?.mediaId
+                val rawUrl = currentId?.let { service.resolveStreamUrl(it) }
+                    ?: service.currentStreamUrl
+                if (rawUrl == null) {
+                    Toast.makeText(context, R.string.cast_stream_failed, Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
+
+                // Route through the phone-side relay so googlevideo binds to the phone's IP, not the
+                // Sonos speaker's — the same Stage-2 fix used by FCast (see CastConnector.doConnect).
+                service.castStreamRelay.receiverAddress =
+                    java.net.InetAddress.getByName(device.ipAddress)
+                val streamUrl = currentId?.let { service.relayedStreamUrl(it, rawUrl) } ?: rawUrl
+                val mimeType = currentId?.let { service.streamContentType(it) } ?: "audio/mp4"
+
+                val posMs = player.currentPosition
+                val durMs = player.duration
+                val resumeSec = if (durMs > 0 && posMs >= durMs - 1500) 0.0
+                                else (posMs / 1000.0).coerceAtLeast(0.0)
+
+                var connectFailed = false
+                service.sonosConnector.connect(
+                    device = device,
+                    streamUrl = streamUrl,
+                    metadata = mediaMetadata,
+                    mimeType = mimeType,
+                    resumePosSec = resumeSec,
+                    onSuccess = { /* spinner cleared in finally */ },
+                    onFailure = { connectFailed = true },
+                )
+
+                if (connectFailed) {
+                    Toast.makeText(
+                        context,
+                        context.getString(R.string.cast_connect_failed, device.roomName),
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                } else {
+                    onDismiss()
+                }
+            } catch (e: Exception) {
+                Toast.makeText(
+                    context,
+                    context.getString(R.string.cast_connect_failed, device.roomName),
+                    Toast.LENGTH_SHORT,
+                ).show()
+            } finally {
+                connectingDevice = null
+            }
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 24.dp)
             .padding(bottom = 24.dp),
     ) {
-        val connected = connectedDevice
         CastHeader(
-            connected = connected != null,
+            connected = isAnythingConnected,
             // Reload only makes sense over the device list — not while connected (only the Stop row
             // shows) and not before the lib is ready (no discovery yet).
-            showRefresh = libState is CastLibState.Ready && connected == null,
+            showRefresh = libState is CastLibState.Ready && !isAnythingConnected,
             refreshing = refreshing,
             onRefresh = { service.scope.launch { service.castDeviceRefresher.refresh() } },
         )
 
         when (val s = libState) {
             CastLibState.Idle -> CastCenteredColumn {
+                // Sonos devices can still be listed and connected without the FCast lib — show them
+                // before the FCast consent prompt if any were found.
+                if (sonosDevices.isNotEmpty()) {
+                    SonosDeviceRows(
+                        devices = sonosDevices,
+                        connectedDevice = connectedSonosDevice,
+                        connectingDevice = connectingDevice,
+                        onConnect = { connectSonos(it) },
+                        onDisconnect = { service.sonosConnector.disconnect(); onDismiss() },
+                    )
+                    Spacer(Modifier.height(16.dp))
+                }
                 CenteredText(
                     text = stringResource(R.string.cast_consent_message),
                     style = MaterialTheme.typography.bodyLarge,
@@ -176,9 +259,23 @@ fun CastPicker(
             }
 
             CastLibState.Ready -> when {
-                connected != null -> CastDeviceRow(
+                // Sonos is connected — show its stop row (FCast session can't coexist).
+                connectedSonosDevice != null -> CastDeviceRow(
                     iconRes = R.drawable.cast_connected,
-                    name = connected.name(),
+                    name = connectedSonosDevice!!.roomName,
+                    subtitle = stringResource(R.string.connected),
+                    trailing = stringResource(R.string.stop_casting),
+                    onClick = {
+                        service.sonosConnector.disconnect()
+                        service.stopCastRelay()
+                        onDismiss()
+                    },
+                )
+
+                // FCast is connected — show its stop row.
+                connectedFcastDevice != null -> CastDeviceRow(
+                    iconRes = R.drawable.cast_connected,
+                    name = connectedFcastDevice!!.name(),
                     subtitle = stringResource(R.string.connected),
                     trailing = stringResource(R.string.stop_casting),
                     onClick = { handler.disconnect(); onDismiss() },
@@ -213,16 +310,13 @@ fun CastPicker(
                                 CastDeviceRow(
                                     iconRes = R.drawable.cast,
                                     name = item.displayName,
-                                    subtitle = if (isConnecting) stringResource(R.string.connecting_to_sonos, item.displayName)
-                                               else stringResource(R.string.sonos_speaker),
-                                    connecting = isConnecting,
-                                    onClick = {
-                                        Toast.makeText(
-                                            context,
-                                            context.getString(R.string.connecting_to_sonos, item.displayName),
-                                            Toast.LENGTH_SHORT,
-                                        ).show()
+                                    subtitle = if (isConnecting) {
+                                        stringResource(R.string.connecting_to_sonos, item.displayName)
+                                    } else {
+                                        stringResource(R.string.sonos_speaker)
                                     },
+                                    connecting = isConnecting,
+                                    onClick = { connectSonos(item.device) },
                                 )
                             }
                         }
@@ -232,6 +326,37 @@ fun CastPicker(
                 }
             }
         }
+    }
+}
+
+/**
+ * Renders Sonos speaker rows with their current connection/connecting state. Used both in the
+ * Ready state device list and as a preview when the FCast lib hasn't been downloaded yet (so Sonos
+ * is usable without FCast consent).
+ */
+@Composable
+private fun SonosDeviceRows(
+    devices: List<SonosDevice>,
+    connectedDevice: SonosDevice?,
+    connectingDevice: String?,
+    onConnect: (SonosDevice) -> Unit,
+    onDisconnect: () -> Unit,
+) {
+    devices.forEach { device ->
+        val isThisConnected = connectedDevice?.udn == device.udn
+        val isConnecting = connectingDevice == device.roomName
+        CastDeviceRow(
+            iconRes = if (isThisConnected) R.drawable.cast_connected else R.drawable.cast,
+            name = device.roomName,
+            subtitle = when {
+                isThisConnected -> stringResource(R.string.connected)
+                isConnecting -> stringResource(R.string.connecting_to_sonos, device.roomName)
+                else -> stringResource(R.string.sonos_speaker)
+            },
+            trailing = if (isThisConnected) stringResource(R.string.stop_casting) else null,
+            connecting = isConnecting,
+            onClick = { if (isThisConnected) onDisconnect() else onConnect(device) },
+        )
     }
 }
 

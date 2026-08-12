@@ -241,6 +241,11 @@ class MusicService :
     // Sonos speaker provider using local SSDP UDP multicast discovery.
     val sonosProvider by lazy { com.jtech.zemer.playback.sonos.SonosProvider(this, scope) }
 
+    // Orchestration for a user-initiated Sonos connect from the picker: resolves the stream URL,
+    // routes it through the cast relay, and drives AVTransport playback. Parallel to castConnector —
+    // the two are independent; touching castConnector is intentionally avoided here.
+    val sonosConnector by lazy { com.jtech.zemer.playback.sonos.SonosConnector(scope = scope) }
+
     private lateinit var audioManager: AudioManager
     private var audioFocusRequest: AudioFocusRequest? = null
     private var lastAudioFocusState = AudioManager.AUDIOFOCUS_NONE
