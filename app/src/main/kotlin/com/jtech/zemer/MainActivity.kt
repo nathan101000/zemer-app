@@ -2234,23 +2234,28 @@ class MainActivity : ComponentActivity() {
         return keyCode == KeyEvent.KEYCODE_BACK || keyCode == KeyEvent.KEYCODE_POWER
     }
 
-    // Routes hardware volume keys to the cast receiver's volume while FCast/Chromecast is connected —
-    // see CastVolumeKeys.decide for why ACTION_UP is consumed rather than ignored. Independent of the
-    // D-pad remapping above; does not touch handleAccessibilityKey/handleMappedKeyEvent.
+    // Routes hardware volume keys to the cast/Sonos receiver's volume while a remote session is
+    // active — see CastVolumeKeys.decide for why ACTION_UP is consumed rather than ignored.
+    // Independent of the D-pad remapping above; does not touch handleAccessibilityKey/handleMappedKeyEvent.
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        val handler = playerConnection?.service?.discoveryHandler
+        val service = playerConnection?.service
+        val handler = service?.discoveryHandler
+        val sonosConnector = service?.sonosConnector
+        val isSonosConnected = sonosConnector?.isConnected?.value == true
         when (CastVolumeKeys.decide(
             event.keyCode,
             event.action,
-            isCasting = handler?.isConnected == true,
+            isCasting = handler?.isConnected == true || isSonosConnected,
             videoPlaybackActive = handler?.videoPlaybackActive == true,
         )) {
             CastVolumeKeyAction.AdjustUp -> {
-                handler?.adjustVolume(+1)
+                if (isSonosConnected) sonosConnector?.controller?.stepVolume(+1)
+                else handler?.adjustVolume(+1)
                 return true
             }
             CastVolumeKeyAction.AdjustDown -> {
-                handler?.adjustVolume(-1)
+                if (isSonosConnected) sonosConnector?.controller?.stepVolume(-1)
+                else handler?.adjustVolume(-1)
                 return true
             }
             CastVolumeKeyAction.Consume -> return true

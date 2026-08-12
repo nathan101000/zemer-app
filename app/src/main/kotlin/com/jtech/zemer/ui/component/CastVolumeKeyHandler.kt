@@ -13,11 +13,13 @@ import com.jtech.zemer.LocalPlayerConnection
 import com.jtech.zemer.playback.CastVolumeKeyAction
 import com.jtech.zemer.playback.CastVolumeKeys
 import com.jtech.zemer.playback.FCastDiscoveryHandler
+import com.jtech.zemer.playback.sonos.SonosConnector
 
 /**
- * A [Modifier] that routes hardware volume keys to the cast receiver while the composable it is applied
- * to lives inside an overlay WINDOW (a Compose ModalBottomSheet / Dialog). Those windows never forward
- * key events to `MainActivity.dispatchKeyEvent`, so the Activity-level handler can't reach them.
+ * A [Modifier] that routes hardware volume keys to the cast or Sonos receiver while the composable
+ * it is applied to lives inside an overlay WINDOW (a Compose ModalBottomSheet / Dialog). Those
+ * windows never forward key events to `MainActivity.dispatchKeyEvent`, so the Activity-level
+ * handler can't reach them.
  *
  * The app's minSdk is 26 and the G1 test device runs API 27, where the platform's OnUnhandledKeyEvent
  * mechanism (API 28+) does not exist — so this deliberately uses Compose's OWN focus-based key pipeline
@@ -35,8 +37,12 @@ import com.jtech.zemer.playback.FCastDiscoveryHandler
  */
 @Composable
 fun castVolumeKeyModifier(seedFocus: Boolean = true): Modifier {
-    val handler = LocalPlayerConnection.current?.service?.discoveryHandler
-    val preview = Modifier.onPreviewKeyEvent { event -> onCastVolumeKeyEvent(event, handler) }
+    val service = LocalPlayerConnection.current?.service
+    val handler = service?.discoveryHandler
+    val sonosConnector = service?.sonosConnector
+    val preview = Modifier.onPreviewKeyEvent { event ->
+        onCastVolumeKeyEvent(event, handler, sonosConnector)
+    }
     if (!seedFocus) return preview
 
     val focusRequester = remember { FocusRequester() }
@@ -47,22 +53,33 @@ fun castVolumeKeyModifier(seedFocus: Boolean = true): Modifier {
         .then(preview)
 }
 
-/** Routes one Compose key event to the receiver volume while casting; returns true to consume it. */
-private fun onCastVolumeKeyEvent(event: KeyEvent, handler: FCastDiscoveryHandler?): Boolean {
-    if (handler == null) return false
+/**
+ * Routes one Compose key event to the receiver volume while casting; returns true to consume it.
+ *
+ * Sonos takes priority over FCast when both are somehow active (shouldn't happen in practice, but
+ * a defensive ordering: the Sonos session is the most recently initiated one if both flags are set).
+ */
+private fun onCastVolumeKeyEvent(
+    event: KeyEvent,
+    handler: FCastDiscoveryHandler?,
+    sonosConnector: SonosConnector?,
+): Boolean {
+    val isSonosConnected = sonosConnector?.isConnected?.value == true
     val native = event.nativeKeyEvent
     return when (CastVolumeKeys.decide(
         native.keyCode,
         native.action,
-        isCasting = handler.isConnected,
-        videoPlaybackActive = handler.videoPlaybackActive,
+        isCasting = handler?.isConnected == true || isSonosConnected,
+        videoPlaybackActive = handler?.videoPlaybackActive == true,
     )) {
         CastVolumeKeyAction.AdjustUp -> {
-            handler.adjustVolume(+1)
+            if (isSonosConnected) sonosConnector?.controller?.stepVolume(+1)
+            else handler?.adjustVolume(+1)
             true
         }
         CastVolumeKeyAction.AdjustDown -> {
-            handler.adjustVolume(-1)
+            if (isSonosConnected) sonosConnector?.controller?.stepVolume(-1)
+            else handler?.adjustVolume(-1)
             true
         }
         CastVolumeKeyAction.Consume -> true
